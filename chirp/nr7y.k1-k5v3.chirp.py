@@ -215,6 +215,22 @@ ul16 NoaaChannel_B;
 
 // --------------------
 
+// FM broadcast receiver config, 0x00A020..0x00A023. Mirrors the packed fmCfg
+// struct in settings.c (SETTINGS_SaveFM / the 0x00A020 read in
+// SETTINGS_InitEEPROM): selFreq, selChn, then a bitfield byte. GCC packs that
+// bitfield from the LSB up, so isMrMode is bit 0 and band is bits 2..1; the
+// firmware memsets the whole 8-byte record to 0xFF before filling it, which is
+// why the top five bits read back as ones. Bytes 0x00A024..0x00A027 are that
+// 0xFF padding and are deliberately left unmapped.
+#seekto 0x00A020;
+ul16 fm_selected_frequency;
+u8   fm_selected_channel;
+u8   __UNUSED_FM:5,
+     fm_band:2,
+     fm_is_mr_mode:1;
+
+// --------------------
+
 #seekto 0x00A028;
 ul16 fmfreq[48];
 
@@ -718,9 +734,35 @@ MEM_BLOCK =     0x80        # largest block of memory that we can reliably write
 CAL_START =     0x00B000    # calibration memory start address
 F4HWN_START =   0x00A158    # calibration F4HWN memory start address
 
-# fm radio supported frequencies
-FMMIN = 76.0
-FMMAX = 108.0
+# FM broadcast receiver.
+#
+# The BK1080 has four selectable bands (BK1080_GetFreqLoLimit /
+# BK1080_GetFreqHiLimit in driver/bk1080.c). The firmware treats a stored
+# channel as tunable when lo <= freq < hi, so the upper bound is exclusive:
+# band 0 tops out at 107.9, not 108.0.
+FM_BAND_LIMITS = {
+    0: (87.5, 108.0),
+    1: (76.0, 108.0),
+    2: (76.0, 90.0),
+    3: (64.0, 76.0),
+}
+
+FM_BAND_LIST = [
+    "87.5 - 107.9 MHz (Europe / US)",
+    "76.0 - 107.9 MHz (Japan wide)",
+    "76.0 - 89.9 MHz (Japan)",
+    "64.0 - 75.9 MHz (OIRT)",
+]
+
+FM_TUNING_MODE_LIST = ["Frequency (VFO)", "Channel (MR)"]
+
+# Widest range any band can reach, used when validating stored channels. A
+# channel is kept as long as *some* band could tune it: validating against only
+# the currently selected band would silently erase a perfectly good channel list
+# the moment someone switched bands, and CHIRP gives no ordering guarantee
+# between the band setting and the channel settings inside one set_settings().
+FMMIN = min(lo for lo, hi in FM_BAND_LIMITS.values())
+FMMAX = max(hi for lo, hi in FM_BAND_LIMITS.values())
 
 # bands supported by the UV-K5
 BANDS_STANDARD = {
@@ -2071,17 +2113,50 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
             elif elname == "set_menu_lock":
                 _mem.set_menu_lock = int(element.value)
 
-            # fm radio
+            # fm radio - receiver configuration (0x00A020)
+            if elname == "fm_band":
+                try:
+                    _mem.fm_band = FM_BAND_LIST.index(str(element.value))
+                except ValueError:
+                    _mem.fm_band = 0
+
+            elif elname == "fm_is_mr_mode":
+                _mem.fm_is_mr_mode = int(
+                    FM_TUNING_MODE_LIST.index(str(element.value)) == 1)
+
+            elif elname == "fm_selected_channel":
+                # Stored zero-based; the UI counts channels from 1.
+                _mem.fm_selected_channel = max(
+                    0, min(int(element.value) - 1, FM_CHANNELS_MAX - 1))
+
+            elif elname == "fm_selected_frequency":
+                band_lo, band_hi = FM_BAND_LIMITS[int(_mem.fm_band) & 0x03]
+                try:
+                    val2 = int(round(float(str(element.value).strip()) * 10))
+                except Exception:
+                    val2 = int(band_lo * 10)
+                # Upper bound is exclusive (lo <= freq < hi), matching the
+                # firmware. Out-of-band values fall back to the bottom of the
+                # band rather than to 0xFFFF: the firmware applies the same
+                # clamp on load, so writing garbage here would just be undone.
+                if val2 < band_lo * 10 or val2 >= band_hi * 10:
+                    val2 = int(band_lo * 10)
+                _mem.fm_selected_frequency = val2
+
+            # fm radio - channel memories (0x00A028)
             for i in range(1, FM_CHANNELS_MAX + 1):
                 freqname = "FM_" + str(i)
                 if elname == freqname:
                     val = str(element.value).strip()
                     try:
-                        val2 = int(float(val)*10)
+                        val2 = int(round(float(val)*10))
                     except Exception:
                         val2 = 0xffff
 
-                    if val2 < FMMIN*10 or val2 > FMMAX*10:
+                    # Validated against the widest band the BK1080 supports,
+                    # not the currently selected one - see FM_BAND_LIMITS.
+                    # Upper bound exclusive, as FM_CheckValidChannel() has it.
+                    if val2 < FMMIN*10 or val2 >= FMMAX*10:
                         val2 = 0xffff
 #                        raise errors.InvalidValueError(
 #                                "FM radio frequency should be a value "
@@ -3019,18 +3094,78 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
 
         # ----------------- FM radio
 
+        # How the radio gets into the FM broadcast receiver, and what the keys
+        # do once it is there. Repeated in each doc string below so it shows up
+        # wherever the user happens to be looking.
+        fm_entry_help = (
+            'To listen to FM broadcast: press F, then long-press the 0/FM key.\n'
+            'Press EXIT to leave FM and return to the radio.\n'
+            'While in FM: UP/DOWN change station or channel, * starts a scan,\n'
+            'and the MENU key toggles between frequency (VFO) and channel (MR)\n'
+            'tuning.')
+
+        # int() matters: list_def hands back the bitwise object untouched when
+        # the value is already in range, and that is not hashable.
+        tmpfmband = int(list_def(int(_mem.fm_band), FM_BAND_LIST, 0))
+        band_lo, band_hi = FM_BAND_LIMITS[tmpfmband]
+        val = RadioSettingValueList(FM_BAND_LIST, FM_BAND_LIST[tmpfmband])
+        rs = RadioSetting("fm_band", "Band", val)
+        rs.set_doc('Tuning range of the BK1080 FM broadcast receiver.\n'
+                   'Channels outside the selected band are stored but will be\n'
+                   'skipped by the radio, so pick the band before entering\n'
+                   'stations.\n\n' + fm_entry_help)
+        fmradio.append(rs)
+
+        val = RadioSettingValueList(
+            FM_TUNING_MODE_LIST,
+            FM_TUNING_MODE_LIST[1 if _mem.fm_is_mr_mode else 0])
+        rs = RadioSetting("fm_is_mr_mode", "Tuning mode", val)
+        rs.set_doc('Which mode the FM receiver starts in.\n'
+                   'Frequency (VFO) tunes continuously; Channel (MR) steps\n'
+                   'through the stored channels below. The MENU key toggles\n'
+                   'this on the radio.\n\n' + fm_entry_help)
+        fmradio.append(rs)
+
+        val = RadioSettingValueInteger(
+            1, FM_CHANNELS_MAX,
+            min(int(_mem.fm_selected_channel) + 1, FM_CHANNELS_MAX))
+        rs = RadioSetting("fm_selected_channel", "Selected channel (MR)", val)
+        rs.set_doc('Channel the FM receiver returns to in Channel (MR) mode.\n'
+                   'If that channel is empty the radio moves to the next\n'
+                   'programmed one.\n\n' + fm_entry_help)
+        fmradio.append(rs)
+
+        tmpfmsel = int(_mem.fm_selected_frequency) / 10.0
+        if tmpfmsel < band_lo or tmpfmsel >= band_hi:
+            tmpfmsel = band_lo
+        val = RadioSettingValueString(0, 5, ("%.1f" % tmpfmsel))
+        rs = RadioSetting("fm_selected_frequency",
+                          "Selected frequency (VFO)", val)
+        rs.set_doc('Station the FM receiver returns to in Frequency (VFO)\n'
+                   'mode, in MHz. Must be inside the selected band\n'
+                   '(%.1f - %.1f MHz); out-of-range values are pulled back to\n'
+                   'the bottom of the band.\n\n%s'
+                   % (band_lo, band_hi - 0.1, fm_entry_help))
+        fmradio.append(rs)
+
         append_label(fmradio, "Channel Memory Radio (MR)", "Frequency (MHz)")
 
         for i in range(1, FM_CHANNELS_MAX + 1):
-            fmfreq = _mem.fmfreq[i-1]/10.0
+            fmfreq = int(_mem.fmfreq[i-1])/10.0
             freq_name = str(fmfreq)
-            if fmfreq < FMMIN or fmfreq > FMMAX:
+            # Upper bound is exclusive, matching FM_CheckValidChannel() in the
+            # firmware (lo <= freq < hi).
+            if fmfreq < FMMIN or fmfreq >= FMMAX:
                 freq_name = ""
             rs = RadioSetting("FM_" + str(i), "Ch " + str(i),
                               RadioSettingValueString(0, 5, freq_name))
-            rs.set_doc('FM Broadcast frequency: Enter the frequency in MHz, example: 96.9\n' + \
-                       'To listen the FM Broadcast band, Long press the 5 key, then if you want to scan for\n' + \
-                       'stations around, press *. Scan result will erase the existing FM broadcast list.')
+            rs.set_doc('FM Broadcast frequency in MHz, for example: 96.9\n'
+                       'Leave blank to erase the channel. Values outside\n'
+                       '%.1f - %.1f MHz are erased; values outside the selected\n'
+                       'band (%.1f - %.1f MHz) are kept but skipped by the radio.\n\n'
+                       'Scanning with * on the radio overwrites this whole list.\n\n%s'
+                       % (FMMIN, FMMAX - 0.1, band_lo, band_hi - 0.1,
+                          fm_entry_help))
             fmradio.append(rs)
 
         # ----------------- Unlock settings
@@ -3352,6 +3487,8 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
         append_label(help_group,"(Lx) = Low TX power, with x = level 1 to 5" , "Under each VFO" )
         append_label(help_group,"(W) = Wide BF filter: 12.5kHz (WIDE)" , "Under each VFO" )
         append_label(help_group,"(N) = Narrow BF filter: 6.25kHz (NARROW)" , "Under each VFO" )
+        append_label(help_group,"(6k) = Wide filter on a CW or USB channel" , "Under each VFO, replaces W/N" )
+        append_label(help_group,"(2k) = Narrow filter on a CW or USB channel" , "Under each VFO, replaces W/N" )
 
         append_label(help_group,"" , "" )
 
@@ -3398,6 +3535,7 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
 
         append_label(help_group,"","" )
         append_label(help_group,"(4 FC) = long press: start the CTCSS & frequency scan " , "Same as long press " )
+        append_label(help_group,"(4 FC) = F then LONG press: toggle the RX filter bandwidth of the active VFO " , "FM/AM show W/N, CW & USB show 6k/2k " )
         append_label(help_group,"(4 FC) = short press: digit 4  "," " )
 
 
@@ -3405,6 +3543,7 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
         
         append_label(help_group,"(5 NOAA) = long press: if in VFO mode: display ScnRnG " , "Display fagci spectrum analyze " )
         append_label(help_group,"(5 NOAA) = long press: if in memory mode,  change the scan list " , " ")
+        append_label(help_group,"(5 NOAA) = F then LONG press: Code Practice Oscillator (CPO) " , "CW practice with sidetone only, no RF. EXIT leaves it " )
         append_label(help_group,"(5 NOAA) = short press: digit 5  "," " )
 
         append_label(help_group,"","" )
@@ -3414,12 +3553,14 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
 
         append_label(help_group,"","" )
                 
-        append_label(help_group,"(0 FM) = long press: FM Broadcast listening ", "Same as long press " )
+        append_label(help_group,"(0 FM) = long press: rotate the reception mode (FM/AM/USB/CW) of the active VFO ", "Same as long press " )
+        append_label(help_group,"(0 FM) = F then LONG press: FM Broadcast listening ", "EXIT leaves FM radio " )
         append_label(help_group,"(0 FM) = short press: digit 0  "," " )
 
         append_label(help_group,"","")
         
-        append_label(help_group,"(7 VOX) = long press: change voice Activation (VX) " , "Same as long press " )
+        append_label(help_group,"(7 VOX) = long press: on a CW channel, toggle break-in (BKIN) on/off " , "Break-in keys the transmitter straight from the paddle " )
+        append_label(help_group,"(7 VOX) = long press: on any other channel, change voice Activation (VX) " , "Same as long press " )
         append_label(help_group,"(7 VOX) = short press: digit 7  "," " )
 
         append_label(help_group,"","" )
